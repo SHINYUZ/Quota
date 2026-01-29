@@ -58,6 +58,19 @@ install_vnstat_if_needed() {
     echo -e ""
 }
 
+ensure_vnstat_interval() {
+    local conf="/etc/vnstat.conf"
+    if [ ! -f "$conf" ]; then
+        return
+    fi
+    if grep -q '^[[:space:]]*UpdateInterval' "$conf"; then
+        sed -i 's/^[[:space:]]*UpdateInterval.*/UpdateInterval 10/' "$conf"
+    else
+        echo "UpdateInterval 10" >> "$conf"
+    fi
+    systemctl restart vnstat >/dev/null 2>&1
+}
+
 ensure_vnstat_iface() {
     local iface="$1"
     if [[ -z "$iface" ]]; then
@@ -143,7 +156,7 @@ setup_wizard() {
     echo -e ""
     echo -e "${YELLOW}------------ 初始化配置 ------------${PLAIN}"
     echo -e ""
-    echo -e "请选择计费口径:"
+    echo -e "请选择流量统计:"
     echo -e ""
     echo -e " 1. 双向总流量(入+出)"
     echo -e ""
@@ -322,32 +335,49 @@ PY
 }
 
 show_usage() {
-    load_config
-    ensure_vnstat_iface "$IFACE"
-    local bytes=$(get_usage_bytes "$MODE" "$IFACE")
-    local limit_bytes=$((QUOTA_GB * 1024 * 1024 * 1024))
-    local used_h=$(format_bytes ${bytes:-0})
-    local limit_h="${QUOTA_GB} GB"
+    while true; do
+        load_config
+        ensure_vnstat_iface "$IFACE"
+        local bytes=$(get_usage_bytes "$MODE" "$IFACE")
+        local limit_bytes=$((QUOTA_GB * 1024 * 1024 * 1024))
+        local used_h=$(format_bytes ${bytes:-0})
+        local limit_h="${QUOTA_GB} GB"
 
-    echo -e "${YELLOW}------------ 当前流量使用情况 ------------${PLAIN}"
-    echo -e ""
-    echo -e " 网卡: ${GREEN}${IFACE}${PLAIN}"
-    echo -e ""
-    if [[ "$MODE" == "1" ]]; then
-        mode_text="双向总流量"
-    elif [[ "$MODE" == "2" ]]; then
-        mode_text="仅入站"
-    else
-        mode_text="仅出站"
-    fi
-    echo -e " 口径: ${BLUE}${mode_text}${PLAIN}"
-    echo -e ""
-    echo -e " 已用: ${GREEN}${used_h}${PLAIN}"
-    echo -e ""
-    echo -e " 限额: ${YELLOW}${limit_h}${PLAIN}"
-    echo -e ""
-    read -n 1 -s -r -p "按任意键返回..."
-    echo -e ""
+        echo -e "${YELLOW}------------ 当前流量使用情况 ------------${PLAIN}"
+        echo -e ""
+        echo -e " 网卡: ${GREEN}${IFACE}${PLAIN}"
+        echo -e ""
+        if [[ "$MODE" == "1" ]]; then
+            mode_text="双向总流量"
+        elif [[ "$MODE" == "2" ]]; then
+            mode_text="仅入站"
+        else
+            mode_text="仅出站"
+        fi
+        echo -e " 口径: ${BLUE}${mode_text}${PLAIN}"
+        echo -e ""
+        echo -e " 已用: ${GREEN}${used_h}${PLAIN}"
+        echo -e ""
+        echo -e " 限额: ${YELLOW}${limit_h}${PLAIN}"
+        echo -e ""
+        echo -e " 1. 刷新统计"
+        echo -e ""
+        echo -e " 0. 返回"
+        echo -e ""
+        read -p "请输入选项[0-1]: " c
+        case "$c" in
+            1) 
+                echo -e "\n${GREEN}正在刷新数据...${PLAIN}"
+                systemctl restart vnstat
+                sleep 1
+                echo -e ""
+                continue 
+                ;;
+            0) return ;;
+            *) echo -e ""; continue ;;
+        esac
+        echo -e ""
+    done
 }
 
 ensure_monitor_timer() {
@@ -383,6 +413,7 @@ stop_monitor_timer() {
 }
 
 show_monitor_status() {
+    echo -e ""
     echo -e "${YELLOW}------------ 监控状态 ------------${PLAIN}"
     echo -e ""
     if systemctl is-active --quiet quota-traffic.timer; then
@@ -476,10 +507,10 @@ menu() {
 
         case "$num" in
             1) echo -e ""; show_usage ;;
-            2) echo -e ""; setup_wizard ;;
+            2) setup_wizard ;;
             3) ensure_monitor_timer; echo -e "\n${GREEN}监控已启动${PLAIN}\n"; read -n 1 -s -r -p "按任意键返回..."; echo -e "";;
             4) stop_monitor_timer; echo -e "\n${YELLOW}监控已停止${PLAIN}\n"; read -n 1 -s -r -p "按任意键返回..."; echo -e "";;
-            5) echo -e ""; show_monitor_status ;;
+            5) show_monitor_status ;;
             6) block_ports; echo -e "\n${GREEN}已封禁所有转发端口${PLAIN}\n"; read -n 1 -s -r -p "按任意键返回..."; echo -e "";;
             7) unblock_ports; echo -e "\n${GREEN}已解除封禁所有转发端口${PLAIN}\n"; read -n 1 -s -r -p "按任意键返回..."; echo -e "";;
             8) uninstall_all ;;
@@ -554,12 +585,12 @@ if [[ "$1" == "reset_exec" ]]; then
         date +%Y-%m-%d > "$STATE_FILE"
 
         echo -e ""
-        echo -e "${GREEN}重置完成：流量统计已清零，转发端口已恢复！${PLAIN}"
+        echo -e "${GREEN}重置完成：流量统计已清零，转发端口已恢复。${PLAIN}"
         echo -e ""
         exit 0
     else
         echo -e ""
-        echo -e "${RED}重置失败：vnstat 初始化失败！${PLAIN}"
+        echo -e "${RED}重置失败：vnstat 初始化失败。${PLAIN}"
         echo -e ""
         exit 1
     fi
@@ -568,6 +599,7 @@ fi
 check_root
 init_dirs
 install_vnstat_if_needed
+ensure_vnstat_interval
 set_quota_shortcut
 
 if [ ! -f "$CONFIG_FILE" ]; then
