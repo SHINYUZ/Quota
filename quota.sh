@@ -514,13 +514,55 @@ if [[ "$1" == "reset_exec" ]]; then
     init_dirs
     load_config
     if [[ -z "$MODE" || -z "$QUOTA_GB" || -z "$RESET_DAY" || -z "$IFACE" ]]; then
-        exit 0
+        echo -e ""
+        echo -e "${RED}重置失败：未检测到配置。${PLAIN}"
+        echo -e ""
+        exit 1
     fi
+
     ensure_vnstat_iface "$IFACE"
-    vnstat --reset -i "$IFACE" >/dev/null 2>&1
-    unblock_ports
-    date +%Y-%m-%d > "$STATE_FILE"
-    exit 0
+
+    # 读取 vnstat 数据库目录（默认 /var/lib/vnstat）
+    DB_DIR=$(awk -F'"' '/DatabaseDir/ {print $2}' /etc/vnstat.conf 2>/dev/null)
+    if [[ -z "$DB_DIR" ]]; then
+        DB_DIR="/var/lib/vnstat"
+    fi
+
+    systemctl stop vnstat >/dev/null 2>&1
+
+    if [ -f "$DB_DIR/vnstat.db" ]; then
+        # 如果是单库模式，优先尝试按网卡删除（有些版本支持 --remove）
+        if vnstat --longhelp 2>/dev/null | grep -q -- '--remove'; then
+            vnstat --remove -i "$IFACE" --force >/dev/null 2>&1
+        else
+            # 退化方案：删除整库（会清空所有网卡统计）
+            rm -f "$DB_DIR/vnstat.db"
+        fi
+    else
+        # 旧版本单文件模式
+        rm -f "$DB_DIR/$IFACE" "$DB_DIR/$IFACE.db"
+    fi
+
+    vnstat --add -i "$IFACE" >/dev/null 2>&1 || vnstat --create -i "$IFACE" >/dev/null 2>&1
+    systemctl start vnstat >/dev/null 2>&1
+
+    if vnstat --json -i "$IFACE" >/dev/null 2>&1; then
+        # 清理手动封禁标记（否则不会解封）
+        rm -f /etc/realm/manual_block_*.conf
+
+        unblock_ports
+        date +%Y-%m-%d > "$STATE_FILE"
+
+        echo -e ""
+        echo -e "${GREEN}重置完成：流量统计已清零，转发端口已恢复！${PLAIN}"
+        echo -e ""
+        exit 0
+    else
+        echo -e ""
+        echo -e "${RED}重置失败：vnstat 初始化失败！${PLAIN}"
+        echo -e ""
+        exit 1
+    fi
 fi
 
 check_root
