@@ -10,7 +10,7 @@ wget -N --no-check-certificate "https://raw.githubusercontent.com/SHINYUZ/Quota/
 使用镜像加速源下载：
 
 ```bash
-wget -N --no-check-certificate https://ghproxy.net/https://raw.githubusercontent.com/SHINYUZ/Quota/main/quota.sh && chmod +x quota.sh && sed -i 's|https://github.com|https://ghproxy.net/https://github.com|g' quota.sh && sed -i 's|https://api.github.com|https://ghproxy.net/https://api.github.com|g' quota.sh && ./quota.sh
+
 ```
 如果下载失败，请使用其他加速源下载
 
