@@ -58,6 +58,25 @@ install_vnstat_if_needed() {
     echo -e ""
 }
 
+ensure_vnstat_iface() {
+    local iface="$1"
+    if [[ -z "$iface" ]]; then
+        return
+    fi
+    vnstat --json -i "$iface" >/dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+        vnstat -u -i "$iface" >/dev/null 2>&1 || vnstat --add -i "$iface" >/dev/null 2>&1 || vnstat --create -i "$iface" >/dev/null 2>&1
+        systemctl restart vnstat >/dev/null 2>&1
+        return
+    fi
+    local has_data
+    has_data=$(vnstat --json -i "$iface" 2>/dev/null | awk '/"month"/ {print 1; exit}')
+    if [[ -z "$has_data" ]]; then
+        vnstat -u -i "$iface" >/dev/null 2>&1 || vnstat --add -i "$iface" >/dev/null 2>&1 || vnstat --create -i "$iface" >/dev/null 2>&1
+        systemctl restart vnstat >/dev/null 2>&1
+    fi
+}
+
 set_quota_shortcut() {
     if [ ! -f "/usr/bin/qo" ]; then
         ln -sf "$SCRIPT_PATH" /usr/bin/qo
@@ -155,6 +174,8 @@ setup_wizard() {
         IFACE="$def_iface"
     fi
 
+    ensure_vnstat_iface "$IFACE"
+
     save_config
     ensure_reset_timer
     ensure_monitor_timer
@@ -229,11 +250,11 @@ format_bytes() {
     if [[ $b -lt 1024 ]]; then
         echo "${b} B"
     elif [[ $b -lt 1048576 ]]; then
-        echo "$((b/1024)) KB"
+        awk -v v="$b" 'BEGIN{printf "%.2f KB\n", v/1024}'
     elif [[ $b -lt 1073741824 ]]; then
-        echo "$((b/1048576)) MB"
+        awk -v v="$b" 'BEGIN{printf "%.2f MB\n", v/1048576}'
     else
-        echo "$((b/1073741824)) GB"
+        awk -v v="$b" 'BEGIN{printf "%.2f GB\n", v/1073741824}'
     fi
 }
 
@@ -242,42 +263,58 @@ get_usage_bytes() {
     local iface="$2"
 
     if command -v python3 >/dev/null 2>&1; then
-        python3 - <<'PY'
+        python3 - "$mode" "$iface" <<'PY'
 import json,subprocess,sys
 mode=sys.argv[1]
 iface=sys.argv[2]
-out=subprocess.check_output(["vnstat","--json","-i",iface],text=True)
-data=json.loads(out)
-traffic=data["interfaces"][0]["traffic"]["month"]
-cur=traffic[-1]
-rx=cur["rx"]*1024
-tx=cur["tx"]*1024
-if mode=="1":
-    val=rx+tx
-elif mode=="2":
-    val=rx
-else:
-    val=tx
-print(val)
+try:
+    out=subprocess.check_output(["vnstat","--json","-i",iface],text=True)
+    data=json.loads(out)
+    interfaces=data.get("interfaces") or []
+    if not interfaces:
+        print(0); raise SystemExit
+    traffic=interfaces[0].get("traffic",{}).get("month") or []
+    if not traffic:
+        print(0); raise SystemExit
+    cur=traffic[-1]
+    rx=cur.get("rx",0)
+    tx=cur.get("tx",0)
+    if mode=="1":
+        val=rx+tx
+    elif mode=="2":
+        val=rx
+    else:
+        val=tx
+    print(val)
+except Exception:
+    print(0)
 PY
     elif command -v python >/dev/null 2>&1; then
-        python - <<'PY'
+        python - "$mode" "$iface" <<'PY'
 import json,subprocess,sys
 mode=sys.argv[1]
 iface=sys.argv[2]
-out=subprocess.check_output(["vnstat","--json","-i",iface],text=True)
-data=json.loads(out)
-traffic=data["interfaces"][0]["traffic"]["month"]
-cur=traffic[-1]
-rx=cur["rx"]*1024
-tx=cur["tx"]*1024
-if mode=="1":
-    val=rx+tx
-elif mode=="2":
-    val=rx
-else:
-    val=tx
-print(val)
+try:
+    out=subprocess.check_output(["vnstat","--json","-i",iface],text=True)
+    data=json.loads(out)
+    interfaces=data.get("interfaces") or []
+    if not interfaces:
+        print(0); raise SystemExit
+    traffic=interfaces[0].get("traffic",{}).get("month") or []
+    if not traffic:
+        print(0); raise SystemExit
+    cur=traffic[-1]
+    rx=cur.get("rx",0)
+    tx=cur.get("tx",0)
+    if mode=="1":
+        val=rx+tx
+    elif mode=="2":
+        val=rx
+    else:
+        val=tx
+    print(val)
+except Exception:
+    print(0)
 PY
     else
         echo 0
@@ -286,10 +323,11 @@ PY
 
 show_usage() {
     load_config
+    ensure_vnstat_iface "$IFACE"
     local bytes=$(get_usage_bytes "$MODE" "$IFACE")
     local limit_bytes=$((QUOTA_GB * 1024 * 1024 * 1024))
     local used_h=$(format_bytes ${bytes:-0})
-    local limit_h=$(format_bytes ${limit_bytes:-0})
+    local limit_h="${QUOTA_GB} GB"
 
     echo -e "${YELLOW}------------ 当前流量使用情况 ------------${PLAIN}"
     echo -e ""
@@ -458,6 +496,8 @@ if [[ "$1" == "monitor" ]]; then
         exit 0
     fi
 
+    ensure_vnstat_iface "$IFACE"
+
     bytes=$(get_usage_bytes "$MODE" "$IFACE")
     limit_bytes=$((QUOTA_GB * 1024 * 1024 * 1024))
 
@@ -476,6 +516,7 @@ if [[ "$1" == "reset_exec" ]]; then
     if [[ -z "$MODE" || -z "$QUOTA_GB" || -z "$RESET_DAY" || -z "$IFACE" ]]; then
         exit 0
     fi
+    ensure_vnstat_iface "$IFACE"
     vnstat --reset -i "$IFACE" >/dev/null 2>&1
     unblock_ports
     date +%Y-%m-%d > "$STATE_FILE"
