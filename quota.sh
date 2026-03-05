@@ -199,22 +199,20 @@ ensure_block_chain() {
     fi
 }
 
-is_manual_blocked() {
-    local port=$1
-    [[ -f "$TRAFFIC_DIR/manual_block_${port}.conf" ]]
-}
-
 block_ports() {
     ensure_block_chain
     touch "$TRAFFIC_DIR/manual_block_all.conf"
     for port in $(get_ports); do
-        touch "$TRAFFIC_DIR/manual_block_${port}.conf"
+        # quota 专用标记，不干扰转发脚本的 manual_block_${port}.conf
+        touch "$TRAFFIC_DIR/quota_manual_block_${port}.conf"
+        # 写入 quota_block
         if ! nft list chain inet quota_block input | grep -q "tcp dport $port drop"; then
             nft add rule inet quota_block input tcp dport $port drop
         fi
         if ! nft list chain inet quota_block input | grep -q "udp dport $port drop"; then
             nft add rule inet quota_block input udp dport $port drop
         fi
+        # 写入 realm_block，让转发脚本端口状态显示 stopped
         if ! nft list chain inet realm_block input | grep -q "tcp dport $port drop"; then
             nft add rule inet realm_block input tcp dport $port drop
         fi
@@ -228,13 +226,20 @@ unblock_ports() {
     ensure_block_chain
     rm -f "$TRAFFIC_DIR/manual_block_all.conf"
     for port in $(get_ports); do
-        rm -f "$TRAFFIC_DIR/manual_block_${port}.conf"
+        # 只删 quota 自己的标记，不碰转发脚本的 manual_block_${port}.conf
+        rm -f "$TRAFFIC_DIR/quota_manual_block_${port}.conf"
+        # 如果转发脚本手动关闭了这个端口，跳过解封
+        if [[ -f "$TRAFFIC_DIR/manual_block_${port}.conf" ]]; then
+            continue
+        fi
+        # 清 quota_block
         while nft -a list chain inet quota_block input | grep -q "tcp dport $port drop"; do
             nft delete rule inet quota_block input handle $(nft -a list chain inet quota_block input | grep "tcp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
         done
         while nft -a list chain inet quota_block input | grep -q "udp dport $port drop"; do
             nft delete rule inet quota_block input handle $(nft -a list chain inet quota_block input | grep "udp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
         done
+        # 清 realm_block
         while nft -a list chain inet realm_block input | grep -q "tcp dport $port drop"; do
             nft delete rule inet realm_block input handle $(nft -a list chain inet realm_block input | grep "tcp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
         done
@@ -438,6 +443,7 @@ uninstall_all() {
     systemctl daemon-reload
     rm -f "$CONFIG_FILE" "$STATE_FILE" /usr/bin/qo
     rm -f "$TRAFFIC_DIR/manual_block_all.conf"
+    rm -f "$TRAFFIC_DIR/quota_manual_block_"*.conf
     unblock_ports
     nft delete table inet quota_block 2>/dev/null
     if systemctl list-unit-files | grep -q '^vnstat\.service'; then
@@ -543,8 +549,8 @@ if [[ "$1" == "reset_exec" ]]; then
     vnstat --add -i "$IFACE" >/dev/null 2>&1 || vnstat --create -i "$IFACE" >/dev/null 2>&1
     systemctl start vnstat >/dev/null 2>&1
     if vnstat --json -i "$IFACE" >/dev/null 2>&1; then
-        rm -f /etc/realm/manual_block_all.conf
-        rm -f /etc/realm/manual_block_*.conf
+        rm -f "$TRAFFIC_DIR/manual_block_all.conf"
+        rm -f "$TRAFFIC_DIR/quota_manual_block_"*.conf
         unblock_ports
         date +%Y-%m-%d > "$STATE_FILE"
         echo -e "\n${GREEN}重置完成：流量统计已清零，转发端口已恢复。${PLAIN}\n"
