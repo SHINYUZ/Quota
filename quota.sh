@@ -5,14 +5,12 @@
 #  说明: 使用 vnstat 统计全机流量，超限后封禁全部转发端口
 # ====================================================
 
-# 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 BLUE='\033[0;36m'
 
-# 路径定义
 REALM_CONFIG="/etc/realm/config.toml"
 TRAFFIC_DIR="/etc/realm"
 CONFIG_FILE="/etc/realm/quota.conf"
@@ -39,10 +37,8 @@ install_vnstat_if_needed() {
     if command -v vnstat >/dev/null 2>&1; then
         return
     fi
-
     echo -e "${YELLOW}检测到未安装 vnstat，正在自动安装...${PLAIN}"
     echo -e ""
-
     if [ -f /etc/debian_version ]; then
         apt-get update && apt-get install -y vnstat
     elif [ -f /etc/redhat-release ]; then
@@ -51,7 +47,6 @@ install_vnstat_if_needed() {
         echo -e "${RED}无法识别系统类型，请手动安装 vnstat！${PLAIN}"
         exit 1
     fi
-
     systemctl enable --now vnstat >/dev/null 2>&1
     echo -e ""
     echo -e "${GREEN}vnstat 已安装并启动${PLAIN}"
@@ -60,9 +55,7 @@ install_vnstat_if_needed() {
 
 ensure_vnstat_interval() {
     local conf="/etc/vnstat.conf"
-    if [ ! -f "$conf" ]; then
-        return
-    fi
+    if [ ! -f "$conf" ]; then return; fi
     if grep -q '^[[:space:]]*UpdateInterval' "$conf"; then
         sed -i 's/^[[:space:]]*UpdateInterval.*/UpdateInterval 10/' "$conf"
     else
@@ -73,9 +66,7 @@ ensure_vnstat_interval() {
 
 ensure_vnstat_iface() {
     local iface="$1"
-    if [[ -z "$iface" ]]; then
-        return
-    fi
+    if [[ -z "$iface" ]]; then return; fi
     vnstat --json -i "$iface" >/dev/null 2>&1
     if [[ $? -ne 0 ]]; then
         vnstat -u -i "$iface" >/dev/null 2>&1 || vnstat --add -i "$iface" >/dev/null 2>&1 || vnstat --create -i "$iface" >/dev/null 2>&1
@@ -114,10 +105,7 @@ EOF
 }
 
 ensure_reset_timer() {
-    if [[ -z "$RESET_DAY" ]]; then
-        return
-    fi
-
+    if [[ -z "$RESET_DAY" ]]; then return; fi
     cat > "$RESET_SERVICE" <<EOF
 [Unit]
 Description=Quota Monthly Reset
@@ -126,7 +114,6 @@ Description=Quota Monthly Reset
 Type=oneshot
 ExecStart=/bin/bash $SCRIPT_PATH reset_exec
 EOF
-
     cat > "$RESET_TIMER" <<EOF
 [Unit]
 Description=Quota Monthly Reset Timer
@@ -139,7 +126,6 @@ Unit=quota-reset.service
 [Install]
 WantedBy=timers.target
 EOF
-
     systemctl daemon-reload
     systemctl enable --now quota-reset.timer >/dev/null 2>&1
 }
@@ -168,27 +154,16 @@ setup_wizard() {
     echo -e ""
     read -p "请选择[0-3]: " MODE
     echo -e ""
-
-    if [[ "$MODE" == "0" ]]; then
-        exit 0
-    fi
-
+    if [[ "$MODE" == "0" ]]; then exit 0; fi
     read -p "请输入月限额(GB): " QUOTA_GB
     echo -e ""
-
     read -p "每月重置日(1-31): " RESET_DAY
     echo -e ""
-
     def_iface=$(detect_iface)
     read -p "统计网卡(回车默认 $def_iface): " IFACE
     echo -e ""
-
-    if [[ -z "$IFACE" ]]; then
-        IFACE="$def_iface"
-    fi
-
+    if [[ -z "$IFACE" ]]; then IFACE="$def_iface"; fi
     ensure_vnstat_iface "$IFACE"
-
     save_config
     ensure_reset_timer
     ensure_monitor_timer
@@ -201,13 +176,7 @@ setup_wizard() {
 get_ports() {
     {
         if [ -f "$REALM_CONFIG" ]; then
-            awk -F'=' '
-                $1 ~ /listen/ {
-                    gsub(/[ "]/, "", $2)
-                    sub(/^\[::]:/, "", $2)
-                    print $2
-                }
-            ' "$REALM_CONFIG"
+            grep 'listen' "$REALM_CONFIG" | awk -F']' '{print $2}' | tr -d ':"'
         fi
         if command -v iptables >/dev/null 2>&1; then
             iptables -t nat -S PREROUTING 2>/dev/null | awk '{
@@ -220,6 +189,10 @@ get_ports() {
 }
 
 ensure_block_chain() {
+    if ! nft list table inet quota_block >/dev/null 2>&1; then
+        nft add table inet quota_block
+        nft add chain inet quota_block input { type filter hook input priority -200 \; }
+    fi
     if ! nft list table inet realm_block >/dev/null 2>&1; then
         nft add table inet realm_block
         nft add chain inet realm_block input { type filter hook input priority -300 \; }
@@ -233,7 +206,15 @@ is_manual_blocked() {
 
 block_ports() {
     ensure_block_chain
+    touch "$TRAFFIC_DIR/manual_block_all.conf"
     for port in $(get_ports); do
+        touch "$TRAFFIC_DIR/manual_block_${port}.conf"
+        if ! nft list chain inet quota_block input | grep -q "tcp dport $port drop"; then
+            nft add rule inet quota_block input tcp dport $port drop
+        fi
+        if ! nft list chain inet quota_block input | grep -q "udp dport $port drop"; then
+            nft add rule inet quota_block input udp dport $port drop
+        fi
         if ! nft list chain inet realm_block input | grep -q "tcp dport $port drop"; then
             nft add rule inet realm_block input tcp dport $port drop
         fi
@@ -245,10 +226,15 @@ block_ports() {
 
 unblock_ports() {
     ensure_block_chain
+    rm -f "$TRAFFIC_DIR/manual_block_all.conf"
     for port in $(get_ports); do
-        if is_manual_blocked "$port"; then
-            continue
-        fi
+        rm -f "$TRAFFIC_DIR/manual_block_${port}.conf"
+        while nft -a list chain inet quota_block input | grep -q "tcp dport $port drop"; do
+            nft delete rule inet quota_block input handle $(nft -a list chain inet quota_block input | grep "tcp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
+        done
+        while nft -a list chain inet quota_block input | grep -q "udp dport $port drop"; do
+            nft delete rule inet quota_block input handle $(nft -a list chain inet quota_block input | grep "udp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
+        done
         while nft -a list chain inet realm_block input | grep -q "tcp dport $port drop"; do
             nft delete rule inet realm_block input handle $(nft -a list chain inet realm_block input | grep "tcp dport $port drop" | head -n 1 | awk '{print $NF}') 2>/dev/null
         done
@@ -271,7 +257,6 @@ format_bytes() {
     fi
 }
 
-# ★ 核心修复：按计费周期（reset_day）累加每日流量，而非直接取当月数据
 get_usage_bytes() {
     local mode="$1"
     local iface="$2"
@@ -285,10 +270,8 @@ from datetime import date
 mode      = sys.argv[1]
 iface     = sys.argv[2]
 reset_day = int(sys.argv[3])
+today     = date.today()
 
-today = date.today()
-
-# 计算当前计费周期起始日
 try:
     if today.day >= reset_day:
         cycle_start = date(today.year, today.month, reset_day)
@@ -296,8 +279,7 @@ try:
         m = today.month - 1 or 12
         y = today.year if today.month > 1 else today.year - 1
         last_day = calendar.monthrange(y, m)[1]
-        actual_day = min(reset_day, last_day)
-        cycle_start = date(y, m, actual_day)
+        cycle_start = date(y, m, min(reset_day, last_day))
 except Exception:
     cycle_start = date(today.year, today.month, 1)
 
@@ -308,18 +290,13 @@ try:
     if not interfaces:
         print(0); raise SystemExit
     days = interfaces[0].get("traffic", {}).get("day") or []
-    rx = 0
-    tx = 0
+    rx = tx = 0
     for d in days:
         di = d.get("date", {})
-        day_date = date(di["year"], di["month"], di["day"])
-        if day_date >= cycle_start:
+        if date(di["year"], di["month"], di["day"]) >= cycle_start:
             rx += d.get("rx", 0)
             tx += d.get("tx", 0)
-    if mode == "1":   val = rx + tx
-    elif mode == "2": val = rx
-    else:             val = tx
-    print(val)
+    print(rx + tx if mode == "1" else rx if mode == "2" else tx)
 except Exception:
     print(0)
 PY
@@ -331,8 +308,7 @@ from datetime import date
 mode      = sys.argv[1]
 iface     = sys.argv[2]
 reset_day = int(sys.argv[3])
-
-today = date.today()
+today     = date.today()
 
 try:
     if today.day >= reset_day:
@@ -341,8 +317,7 @@ try:
         m = today.month - 1 or 12
         y = today.year if today.month > 1 else today.year - 1
         last_day = calendar.monthrange(y, m)[1]
-        actual_day = min(reset_day, last_day)
-        cycle_start = date(y, m, actual_day)
+        cycle_start = date(y, m, min(reset_day, last_day))
 except Exception:
     cycle_start = date(today.year, today.month, 1)
 
@@ -353,18 +328,13 @@ try:
     if not interfaces:
         print(0); raise SystemExit
     days = interfaces[0].get("traffic", {}).get("day") or []
-    rx = 0
-    tx = 0
+    rx = tx = 0
     for d in days:
         di = d.get("date", {})
-        day_date = date(di["year"], di["month"], di["day"])
-        if day_date >= cycle_start:
+        if date(di["year"], di["month"], di["day"]) >= cycle_start:
             rx += d.get("rx", 0)
             tx += d.get("tx", 0)
-    if mode == "1":   val = rx + tx
-    elif mode == "2": val = rx
-    else:             val = tx
-    print(val)
+    print(rx + tx if mode == "1" else rx if mode == "2" else tx)
 except Exception:
     print(0)
 PY
@@ -378,21 +348,15 @@ show_usage() {
         load_config
         ensure_vnstat_iface "$IFACE"
         local bytes=$(get_usage_bytes "$MODE" "$IFACE" "$RESET_DAY")
-        local limit_bytes=$((QUOTA_GB * 1024 * 1024 * 1024))
         local used_h=$(format_bytes ${bytes:-0})
         local limit_h="${QUOTA_GB} GB"
-
         echo -e "${YELLOW}------------ 当前流量使用情况 ------------${PLAIN}"
         echo -e ""
         echo -e " 网卡: ${GREEN}${IFACE}${PLAIN}"
         echo -e ""
-        if [[ "$MODE" == "1" ]]; then
-            mode_text="双向总流量"
-        elif [[ "$MODE" == "2" ]]; then
-            mode_text="仅入站"
-        else
-            mode_text="仅出站"
-        fi
+        if [[ "$MODE" == "1" ]]; then mode_text="双向总流量"
+        elif [[ "$MODE" == "2" ]]; then mode_text="仅入站"
+        else mode_text="仅出站"; fi
         echo -e " 口径: ${BLUE}${mode_text}${PLAIN}"
         echo -e ""
         echo -e " 计费周期: ${BLUE}每月 ${RESET_DAY} 日重置${PLAIN}"
@@ -407,17 +371,10 @@ show_usage() {
         echo -e ""
         read -p "请输入选项[0-1]: " c
         case "$c" in
-            1)
-                echo -e "\n${GREEN}正在刷新数据...${PLAIN}"
-                systemctl restart vnstat
-                sleep 1
-                echo -e ""
-                continue
-                ;;
+            1) echo -e "\n${GREEN}正在刷新数据...${PLAIN}"; systemctl restart vnstat; sleep 1; echo -e ""; continue ;;
             0) return ;;
             *) echo -e ""; continue ;;
         esac
-        echo -e ""
     done
 }
 
@@ -430,7 +387,6 @@ Description=Quota Traffic Monitor
 Type=oneshot
 ExecStart=/bin/bash $SCRIPT_PATH monitor
 EOF
-
     cat > "$MONITOR_TIMER" <<EOF
 [Unit]
 Description=Quota Traffic Monitor Timer
@@ -444,7 +400,6 @@ Unit=quota-traffic.service
 [Install]
 WantedBy=timers.target
 EOF
-
     systemctl daemon-reload
     systemctl enable --now quota-traffic.timer >/dev/null 2>&1
 }
@@ -476,35 +431,23 @@ show_monitor_status() {
 uninstall_all() {
     echo ""
     read -p "确定要卸载脚本及所有组件吗？(y/n): " choice
-    if [[ "$choice" != "y" ]]; then
-        return
-    fi
-
+    if [[ "$choice" != "y" ]]; then return; fi
     stop_monitor_timer
     stop_reset_timer
-    rm -f "$MONITOR_SERVICE"
-    rm -f "$MONITOR_TIMER"
-    rm -f "$RESET_SERVICE"
-    rm -f "$RESET_TIMER"
+    rm -f "$MONITOR_SERVICE" "$MONITOR_TIMER" "$RESET_SERVICE" "$RESET_TIMER"
     systemctl daemon-reload
-
-    rm -f "$CONFIG_FILE"
-    rm -f "$STATE_FILE"
-
-    rm -f /usr/bin/qo
-
+    rm -f "$CONFIG_FILE" "$STATE_FILE" /usr/bin/qo
+    rm -f "$TRAFFIC_DIR/manual_block_all.conf"
     unblock_ports
-
+    nft delete table inet quota_block 2>/dev/null
     if systemctl list-unit-files | grep -q '^vnstat\.service'; then
         systemctl disable --now vnstat >/dev/null 2>&1
     fi
-
     if [ -f /etc/debian_version ]; then
         apt-get remove -y vnstat >/dev/null 2>&1
     elif [ -f /etc/redhat-release ]; then
         yum remove -y vnstat >/dev/null 2>&1
     fi
-
     echo ""
     echo -e "${GREEN}卸载完成！脚本将自动退出。${PLAIN}"
     echo ""
@@ -545,7 +488,6 @@ menu() {
         echo -e " 0. 退出"
         echo -e ""
         read -p "请输入选项[0-8]: " num
-
         case "$num" in
             1) echo -e ""; show_usage ;;
             2) setup_wizard ;;
@@ -564,21 +506,17 @@ menu() {
 if [[ "$1" == "monitor" ]]; then
     init_dirs
     load_config
-    if [[ -z "$MODE" || -z "$QUOTA_GB" || -z "$RESET_DAY" || -z "$IFACE" ]]; then
-        exit 0
-    fi
-
+    if [[ -z "$MODE" || -z "$QUOTA_GB" || -z "$RESET_DAY" || -z "$IFACE" ]]; then exit 0; fi
     ensure_vnstat_iface "$IFACE"
-
     bytes=$(get_usage_bytes "$MODE" "$IFACE" "$RESET_DAY")
     limit_bytes=$((QUOTA_GB * 1024 * 1024 * 1024))
-
-    if [[ ${bytes:-0} -ge $limit_bytes ]]; then
+    if [[ -f "$TRAFFIC_DIR/manual_block_all.conf" ]]; then
+        block_ports
+    elif [[ ${bytes:-0} -ge $limit_bytes ]]; then
         block_ports
     else
         unblock_ports
     fi
-
     exit 0
 fi
 
@@ -586,21 +524,13 @@ if [[ "$1" == "reset_exec" ]]; then
     init_dirs
     load_config
     if [[ -z "$MODE" || -z "$QUOTA_GB" || -z "$RESET_DAY" || -z "$IFACE" ]]; then
-        echo -e ""
-        echo -e "${RED}重置失败：未检测到配置。${PLAIN}"
-        echo -e ""
+        echo -e "\n${RED}重置失败：未检测到配置。${PLAIN}\n"
         exit 1
     fi
-
     ensure_vnstat_iface "$IFACE"
-
     DB_DIR=$(awk -F'"' '/DatabaseDir/ {print $2}' /etc/vnstat.conf 2>/dev/null)
-    if [[ -z "$DB_DIR" ]]; then
-        DB_DIR="/var/lib/vnstat"
-    fi
-
+    if [[ -z "$DB_DIR" ]]; then DB_DIR="/var/lib/vnstat"; fi
     systemctl stop vnstat >/dev/null 2>&1
-
     if [ -f "$DB_DIR/vnstat.db" ]; then
         if vnstat --longhelp 2>/dev/null | grep -q -- '--remove'; then
             vnstat --remove -i "$IFACE" --force >/dev/null 2>&1
@@ -610,23 +540,17 @@ if [[ "$1" == "reset_exec" ]]; then
     else
         rm -f "$DB_DIR/$IFACE" "$DB_DIR/$IFACE.db"
     fi
-
     vnstat --add -i "$IFACE" >/dev/null 2>&1 || vnstat --create -i "$IFACE" >/dev/null 2>&1
     systemctl start vnstat >/dev/null 2>&1
-
     if vnstat --json -i "$IFACE" >/dev/null 2>&1; then
+        rm -f /etc/realm/manual_block_all.conf
         rm -f /etc/realm/manual_block_*.conf
         unblock_ports
         date +%Y-%m-%d > "$STATE_FILE"
-
-        echo -e ""
-        echo -e "${GREEN}重置完成：流量统计已清零，转发端口已恢复。${PLAIN}"
-        echo -e ""
+        echo -e "\n${GREEN}重置完成：流量统计已清零，转发端口已恢复。${PLAIN}\n"
         exit 0
     else
-        echo -e ""
-        echo -e "${RED}重置失败：vnstat 初始化失败。${PLAIN}"
-        echo -e ""
+        echo -e "\n${RED}重置失败：vnstat 初始化失败。${PLAIN}\n"
         exit 1
     fi
 fi
