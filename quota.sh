@@ -204,7 +204,7 @@ get_ports() {
             awk -F'=' '
                 $1 ~ /listen/ {
                     gsub(/[ "]/, "", $2)
-                    sub(/^\[::\]:/, "", $2)
+                    sub(/^\[::]:/, "", $2)
                     print $2
                 }
             ' "$REALM_CONFIG"
@@ -271,60 +271,99 @@ format_bytes() {
     fi
 }
 
+# ★ 核心修复：按计费周期（reset_day）累加每日流量，而非直接取当月数据
 get_usage_bytes() {
     local mode="$1"
     local iface="$2"
+    local reset_day="$3"
 
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "$mode" "$iface" <<'PY'
-import json,subprocess,sys
-mode=sys.argv[1]
-iface=sys.argv[2]
+        python3 - "$mode" "$iface" "$reset_day" <<'PY'
+import json, subprocess, sys, calendar
+from datetime import date
+
+mode      = sys.argv[1]
+iface     = sys.argv[2]
+reset_day = int(sys.argv[3])
+
+today = date.today()
+
+# 计算当前计费周期起始日
 try:
-    out=subprocess.check_output(["vnstat","--json","-i",iface],text=True)
-    data=json.loads(out)
-    interfaces=data.get("interfaces") or []
+    if today.day >= reset_day:
+        cycle_start = date(today.year, today.month, reset_day)
+    else:
+        m = today.month - 1 or 12
+        y = today.year if today.month > 1 else today.year - 1
+        last_day = calendar.monthrange(y, m)[1]
+        actual_day = min(reset_day, last_day)
+        cycle_start = date(y, m, actual_day)
+except Exception:
+    cycle_start = date(today.year, today.month, 1)
+
+try:
+    out = subprocess.check_output(["vnstat", "--json", "-i", iface], text=True)
+    data = json.loads(out)
+    interfaces = data.get("interfaces") or []
     if not interfaces:
         print(0); raise SystemExit
-    traffic=interfaces[0].get("traffic",{}).get("month") or []
-    if not traffic:
-        print(0); raise SystemExit
-    cur=traffic[-1]
-    rx=cur.get("rx",0)
-    tx=cur.get("tx",0)
-    if mode=="1":
-        val=rx+tx
-    elif mode=="2":
-        val=rx
-    else:
-        val=tx
+    days = interfaces[0].get("traffic", {}).get("day") or []
+    rx = 0
+    tx = 0
+    for d in days:
+        di = d.get("date", {})
+        day_date = date(di["year"], di["month"], di["day"])
+        if day_date >= cycle_start:
+            rx += d.get("rx", 0)
+            tx += d.get("tx", 0)
+    if mode == "1":   val = rx + tx
+    elif mode == "2": val = rx
+    else:             val = tx
     print(val)
 except Exception:
     print(0)
 PY
     elif command -v python >/dev/null 2>&1; then
-        python - "$mode" "$iface" <<'PY'
-import json,subprocess,sys
-mode=sys.argv[1]
-iface=sys.argv[2]
+        python - "$mode" "$iface" "$reset_day" <<'PY'
+import json, subprocess, sys, calendar
+from datetime import date
+
+mode      = sys.argv[1]
+iface     = sys.argv[2]
+reset_day = int(sys.argv[3])
+
+today = date.today()
+
 try:
-    out=subprocess.check_output(["vnstat","--json","-i",iface],text=True)
-    data=json.loads(out)
-    interfaces=data.get("interfaces") or []
+    if today.day >= reset_day:
+        cycle_start = date(today.year, today.month, reset_day)
+    else:
+        m = today.month - 1 or 12
+        y = today.year if today.month > 1 else today.year - 1
+        last_day = calendar.monthrange(y, m)[1]
+        actual_day = min(reset_day, last_day)
+        cycle_start = date(y, m, actual_day)
+except Exception:
+    cycle_start = date(today.year, today.month, 1)
+
+try:
+    out = subprocess.check_output(["vnstat", "--json", "-i", iface], text=True)
+    data = json.loads(out)
+    interfaces = data.get("interfaces") or []
     if not interfaces:
         print(0); raise SystemExit
-    traffic=interfaces[0].get("traffic",{}).get("month") or []
-    if not traffic:
-        print(0); raise SystemExit
-    cur=traffic[-1]
-    rx=cur.get("rx",0)
-    tx=cur.get("tx",0)
-    if mode=="1":
-        val=rx+tx
-    elif mode=="2":
-        val=rx
-    else:
-        val=tx
+    days = interfaces[0].get("traffic", {}).get("day") or []
+    rx = 0
+    tx = 0
+    for d in days:
+        di = d.get("date", {})
+        day_date = date(di["year"], di["month"], di["day"])
+        if day_date >= cycle_start:
+            rx += d.get("rx", 0)
+            tx += d.get("tx", 0)
+    if mode == "1":   val = rx + tx
+    elif mode == "2": val = rx
+    else:             val = tx
     print(val)
 except Exception:
     print(0)
@@ -338,7 +377,7 @@ show_usage() {
     while true; do
         load_config
         ensure_vnstat_iface "$IFACE"
-        local bytes=$(get_usage_bytes "$MODE" "$IFACE")
+        local bytes=$(get_usage_bytes "$MODE" "$IFACE" "$RESET_DAY")
         local limit_bytes=$((QUOTA_GB * 1024 * 1024 * 1024))
         local used_h=$(format_bytes ${bytes:-0})
         local limit_h="${QUOTA_GB} GB"
@@ -356,6 +395,8 @@ show_usage() {
         fi
         echo -e " 口径: ${BLUE}${mode_text}${PLAIN}"
         echo -e ""
+        echo -e " 计费周期: ${BLUE}每月 ${RESET_DAY} 日重置${PLAIN}"
+        echo -e ""
         echo -e " 已用: ${GREEN}${used_h}${PLAIN}"
         echo -e ""
         echo -e " 限额: ${YELLOW}${limit_h}${PLAIN}"
@@ -366,12 +407,12 @@ show_usage() {
         echo -e ""
         read -p "请输入选项[0-1]: " c
         case "$c" in
-            1) 
+            1)
                 echo -e "\n${GREEN}正在刷新数据...${PLAIN}"
                 systemctl restart vnstat
                 sleep 1
                 echo -e ""
-                continue 
+                continue
                 ;;
             0) return ;;
             *) echo -e ""; continue ;;
@@ -529,7 +570,7 @@ if [[ "$1" == "monitor" ]]; then
 
     ensure_vnstat_iface "$IFACE"
 
-    bytes=$(get_usage_bytes "$MODE" "$IFACE")
+    bytes=$(get_usage_bytes "$MODE" "$IFACE" "$RESET_DAY")
     limit_bytes=$((QUOTA_GB * 1024 * 1024 * 1024))
 
     if [[ ${bytes:-0} -ge $limit_bytes ]]; then
@@ -553,7 +594,6 @@ if [[ "$1" == "reset_exec" ]]; then
 
     ensure_vnstat_iface "$IFACE"
 
-    # 读取 vnstat 数据库目录（默认 /var/lib/vnstat）
     DB_DIR=$(awk -F'"' '/DatabaseDir/ {print $2}' /etc/vnstat.conf 2>/dev/null)
     if [[ -z "$DB_DIR" ]]; then
         DB_DIR="/var/lib/vnstat"
@@ -562,15 +602,12 @@ if [[ "$1" == "reset_exec" ]]; then
     systemctl stop vnstat >/dev/null 2>&1
 
     if [ -f "$DB_DIR/vnstat.db" ]; then
-        # 如果是单库模式，优先尝试按网卡删除（有些版本支持 --remove）
         if vnstat --longhelp 2>/dev/null | grep -q -- '--remove'; then
             vnstat --remove -i "$IFACE" --force >/dev/null 2>&1
         else
-            # 退化方案：删除整库（会清空所有网卡统计）
             rm -f "$DB_DIR/vnstat.db"
         fi
     else
-        # 旧版本单文件模式
         rm -f "$DB_DIR/$IFACE" "$DB_DIR/$IFACE.db"
     fi
 
@@ -578,9 +615,7 @@ if [[ "$1" == "reset_exec" ]]; then
     systemctl start vnstat >/dev/null 2>&1
 
     if vnstat --json -i "$IFACE" >/dev/null 2>&1; then
-        # 清理手动封禁标记（否则不会解封）
         rm -f /etc/realm/manual_block_*.conf
-
         unblock_ports
         date +%Y-%m-%d > "$STATE_FILE"
 
